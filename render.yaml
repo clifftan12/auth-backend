@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: iinite-auth-backend
+    runtime: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: ALLOW_PREVIEW_CODE
+        value: "false"
+      - key: FRONTEND_BASE_URL
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false

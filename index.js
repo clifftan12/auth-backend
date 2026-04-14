@@ -3,13 +3,37 @@ const cors = require("cors");
 const crypto = require("crypto");
 
 const app = express();
-app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const FRONTEND_BASE_URL = process.env.FRONTEND_BASE_URL || "http://localhost:3000";
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || FRONTEND_BASE_URL)
+  .split(",")
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+const NODE_ENV = process.env.NODE_ENV || "development";
+const ALLOW_PREVIEW_CODE = process.env.ALLOW_PREVIEW_CODE === "true" || NODE_ENV !== "production";
+const TWILIO_ACCOUNT_SID = process.env.TWILIO_ACCOUNT_SID || "";
+const TWILIO_AUTH_TOKEN = process.env.TWILIO_AUTH_TOKEN || "";
+const TWILIO_VERIFY_SERVICE_SID = process.env.TWILIO_VERIFY_SERVICE_SID || "";
+const EMAIL_PROVIDER_API_KEY = process.env.EMAIL_PROVIDER_API_KEY || "";
+const EMAIL_PROVIDER_FROM = process.env.EMAIL_PROVIDER_FROM || "";
+const EMAIL_PROVIDER_API_URL =
+  process.env.EMAIL_PROVIDER_API_URL || "https://api.sendgrid.com/v3/mail/send";
 const verificationStore = new Map();
 const userStore = new Map();
+
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || ALLOWED_ORIGINS.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Origin not allowed by CORS"));
+    },
+  })
+);
 
 function makeUserKey(channel, destination) {
   return `${channel}:${destination.trim().toLowerCase()}`;
@@ -39,7 +63,87 @@ function buildUserResponse(user) {
   };
 }
 
-function startVerification(channel, destination, mode, prefix, res) {
+function isTwilioConfigured() {
+  return Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_VERIFY_SERVICE_SID);
+}
+
+function isEmailProviderConfigured() {
+  return Boolean(EMAIL_PROVIDER_API_KEY && EMAIL_PROVIDER_FROM);
+}
+
+async function sendPhoneCode(destination, code) {
+  if (isTwilioConfigured()) {
+    const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+    const body = new URLSearchParams({
+      To: destination,
+      Channel: "sms",
+      CustomCode: code,
+    });
+
+    const response = await fetch(
+      `https://verify.twilio.com/v2/Services/${TWILIO_VERIFY_SERVICE_SID}/Verifications`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${credentials}`,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body,
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Twilio Verify failed: ${text}`);
+    }
+
+    return;
+  }
+
+  if (!ALLOW_PREVIEW_CODE) {
+    throw new Error("Phone verification provider is not configured.");
+  }
+}
+
+async function sendEmailCode(destination, code) {
+  if (isEmailProviderConfigured()) {
+    const response = await fetch(EMAIL_PROVIDER_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${EMAIL_PROVIDER_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        personalizations: [
+          {
+            to: [{ email: destination }],
+            subject: "Your iinite verification code",
+          },
+        ],
+        from: { email: EMAIL_PROVIDER_FROM, name: "iinite" },
+        content: [
+          {
+            type: "text/plain",
+            value: `Your iinite verification code is ${code}. This code will expire soon.`,
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Email provider failed: ${text}`);
+    }
+
+    return;
+  }
+
+  if (!ALLOW_PREVIEW_CODE) {
+    throw new Error("Email verification provider is not configured.");
+  }
+}
+
+async function startVerification(channel, destination, mode, prefix, res) {
   const normalisedDestination = destination.trim();
   const userKey = makeUserKey(channel, normalisedDestination);
   const existingUser = userStore.get(userKey);
@@ -59,18 +163,30 @@ function startVerification(channel, destination, mode, prefix, res) {
   const verificationId = createVerificationId(prefix);
   const previewCode = createPreviewCode();
 
-  verificationStore.set(verificationId, {
-    channel,
-    destination: normalisedDestination,
-    mode,
-    code: previewCode,
-    createdAt: Date.now(),
-  });
+  try {
+    if (channel === "phone") {
+      await sendPhoneCode(normalisedDestination, previewCode);
+    } else {
+      await sendEmailCode(normalisedDestination, previewCode);
+    }
+
+    verificationStore.set(verificationId, {
+      channel,
+      destination: normalisedDestination,
+      mode,
+      code: previewCode,
+      createdAt: Date.now(),
+    });
+  } catch (error) {
+    return res.status(500).json({
+      message: error instanceof Error ? error.message : "Unable to send verification code.",
+    });
+  }
 
   return res.status(201).json({
     verificationId,
     message: `Verification code sent to your ${channel}.`,
-    previewCode,
+    ...(ALLOW_PREVIEW_CODE ? { previewCode } : {}),
   });
 }
 
@@ -119,7 +235,7 @@ function verifyCode(channel, verificationId, code, mode, res) {
 app.get("/", (req, res) => {
   res.json({
     ok: true,
-    authBaseURL: FRONTEND_BASE_URL,
+    environment: NODE_ENV,
     endpoints: [
       "/auth/email/start",
       "/auth/email/verify",
@@ -129,7 +245,19 @@ app.get("/", (req, res) => {
   });
 });
 
-app.post("/auth/email/start", (req, res) => {
+app.get("/health", (req, res) => {
+  res.json({
+    ok: true,
+    service: "auth-backend",
+    environment: NODE_ENV,
+    providers: {
+      phone: isTwilioConfigured() ? "twilio" : ALLOW_PREVIEW_CODE ? "preview" : "missing",
+      email: isEmailProviderConfigured() ? "email-provider" : ALLOW_PREVIEW_CODE ? "preview" : "missing",
+    },
+  });
+});
+
+app.post("/auth/email/start", async (req, res) => {
   const email = String(req.body?.email ?? "").trim().toLowerCase();
   const mode = String(req.body?.mode ?? "");
 
@@ -148,7 +276,7 @@ app.post("/auth/email/verify", (req, res) => {
   return verifyCode("email", verificationId, code, mode, res);
 });
 
-app.post("/auth/phone/start", (req, res) => {
+app.post("/auth/phone/start", async (req, res) => {
   const phoneNumber = String(req.body?.phoneNumber ?? "").trim();
   const mode = String(req.body?.mode ?? "");
 
