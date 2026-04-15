@@ -77,7 +77,6 @@ async function sendPhoneCode(destination, code) {
     const body = new URLSearchParams({
       To: destination,
       Channel: "sms",
-      CustomCode: code,
     });
 
     const response = await fetch(
@@ -143,6 +142,34 @@ async function sendEmailCode(destination, code) {
   }
 }
 
+async function verifyPhoneCodeWithTwilio(destination, code) {
+  const credentials = Buffer.from(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`).toString("base64");
+  const body = new URLSearchParams({
+    To: destination,
+    Code: code,
+  });
+
+  const response = await fetch(
+    `https://verify.twilio.com/v2/Services/${TWILIO_VERIFY_SERVICE_SID}/VerificationCheck`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Basic ${credentials}`,
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body,
+    }
+  );
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`Twilio Verify check failed: ${text}`);
+  }
+
+  const payload = await response.json();
+  return payload.status === "approved";
+}
+
 async function startVerification(channel, destination, mode, prefix, res) {
   const normalisedDestination = destination.trim();
   const userKey = makeUserKey(channel, normalisedDestination);
@@ -174,7 +201,7 @@ async function startVerification(channel, destination, mode, prefix, res) {
       channel,
       destination: normalisedDestination,
       mode,
-      code: previewCode,
+      code: channel === "phone" && isTwilioConfigured() ? null : previewCode,
       createdAt: Date.now(),
     });
   } catch (error) {
@@ -186,11 +213,11 @@ async function startVerification(channel, destination, mode, prefix, res) {
   return res.status(201).json({
     verificationId,
     message: `Verification code sent to your ${channel}.`,
-    ...(ALLOW_PREVIEW_CODE ? { previewCode } : {}),
+    ...(channel === "phone" && isTwilioConfigured() ? {} : ALLOW_PREVIEW_CODE ? { previewCode } : {}),
   });
 }
 
-function verifyCode(channel, verificationId, code, mode, res) {
+async function verifyCode(channel, verificationId, code, mode, res) {
   const record = verificationStore.get(verificationId);
 
   if (!record || record.channel !== channel) {
@@ -201,8 +228,19 @@ function verifyCode(channel, verificationId, code, mode, res) {
     return res.status(400).json({ message: "Verification mode mismatch." });
   }
 
-  if (record.code !== code) {
-    return res.status(400).json({ message: "Incorrect verification code. Please try again." });
+  try {
+    if (channel === "phone" && isTwilioConfigured()) {
+      const isApproved = await verifyPhoneCodeWithTwilio(record.destination, code);
+      if (!isApproved) {
+        return res.status(400).json({ message: "Incorrect verification code. Please try again." });
+      }
+    } else if (record.code !== code) {
+      return res.status(400).json({ message: "Incorrect verification code. Please try again." });
+    }
+  } catch (error) {
+    return res.status(500).json({
+      message: error instanceof Error ? error.message : "Unable to verify code.",
+    });
   }
 
   const userKey = makeUserKey(channel, record.destination);
@@ -268,7 +306,7 @@ app.post("/auth/email/start", async (req, res) => {
   return startVerification("email", email, mode, "ver_email", res);
 });
 
-app.post("/auth/email/verify", (req, res) => {
+app.post("/auth/email/verify", async (req, res) => {
   const verificationId = String(req.body?.verificationId ?? "");
   const code = String(req.body?.code ?? "").trim();
   const mode = String(req.body?.mode ?? "");
@@ -287,7 +325,7 @@ app.post("/auth/phone/start", async (req, res) => {
   return startVerification("phone", phoneNumber, mode, "ver_phone", res);
 });
 
-app.post("/auth/phone/verify", (req, res) => {
+app.post("/auth/phone/verify", async (req, res) => {
   const verificationId = String(req.body?.verificationId ?? "");
   const code = String(req.body?.code ?? "").trim();
   const mode = String(req.body?.mode ?? "");
