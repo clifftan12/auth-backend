@@ -20,6 +20,18 @@ const EMAIL_PROVIDER_API_KEY = process.env.EMAIL_PROVIDER_API_KEY || "";
 const EMAIL_PROVIDER_FROM = process.env.EMAIL_PROVIDER_FROM || "";
 const EMAIL_PROVIDER_API_URL =
   process.env.EMAIL_PROVIDER_API_URL || "https://api.sendgrid.com/v3/mail/send";
+const WEB_PREMIUM_EMAILS = (process.env.WEB_PREMIUM_EMAILS || "")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
+const WEB_PREMIUM_USER_IDS = (process.env.WEB_PREMIUM_USER_IDS || "")
+  .split(",")
+  .map((value) => value.trim())
+  .filter(Boolean);
+const WEB_PREMIUM_PHONE_NUMBERS = (process.env.WEB_PREMIUM_PHONE_NUMBERS || "")
+  .split(",")
+  .map((value) => value.trim().toLowerCase())
+  .filter(Boolean);
 const verificationStore = new Map();
 const userStore = new Map();
 
@@ -61,6 +73,17 @@ function buildUserResponse(user) {
     phoneNumber: user.phoneNumber,
     hasCompletedProfile: user.hasCompletedProfile,
   };
+}
+
+function hasWebPremiumEntitlement({ userId, email, phoneNumber }) {
+  const normalisedEmail = email ? email.trim().toLowerCase() : "";
+  const normalisedPhone = phoneNumber ? phoneNumber.trim().toLowerCase() : "";
+
+  return (
+    (userId && WEB_PREMIUM_USER_IDS.includes(userId.trim())) ||
+    (normalisedEmail && WEB_PREMIUM_EMAILS.includes(normalisedEmail)) ||
+    (normalisedPhone && WEB_PREMIUM_PHONE_NUMBERS.includes(normalisedPhone))
+  );
 }
 
 function deleteUserRecords({ userId, email, phoneNumber }) {
@@ -319,6 +342,11 @@ app.get("/health", (req, res) => {
       phone: isTwilioConfigured() ? "twilio" : ALLOW_PREVIEW_CODE ? "preview" : "missing",
       email: isEmailProviderConfigured() ? "email-provider" : ALLOW_PREVIEW_CODE ? "preview" : "missing",
     },
+    premium: {
+      webEmailCount: WEB_PREMIUM_EMAILS.length,
+      webUserIDCount: WEB_PREMIUM_USER_IDS.length,
+      webPhoneCount: WEB_PREMIUM_PHONE_NUMBERS.length,
+    },
   });
 });
 
@@ -374,6 +402,23 @@ app.post("/account/delete", (req, res) => {
   return res.json({
     success: true,
     message: "Account deleted.",
+  });
+});
+
+app.post("/account/premium-status", (req, res) => {
+  const userId = String(req.body?.userId ?? "").trim();
+  const email = String(req.body?.email ?? "").trim();
+  const phoneNumber = String(req.body?.phoneNumber ?? "").trim();
+
+  if (!userId && !email && !phoneNumber) {
+    return res.status(400).json({ message: "Account details are required to check premium status." });
+  }
+
+  const isPremium = hasWebPremiumEntitlement({ userId, email, phoneNumber });
+
+  return res.json({
+    isPremium,
+    source: isPremium ? "web" : "none",
   });
 });
 
