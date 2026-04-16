@@ -63,6 +63,33 @@ function buildUserResponse(user) {
   };
 }
 
+function deleteUserRecords({ userId, email, phoneNumber }) {
+  const normalisedEmail = email ? email.trim().toLowerCase() : "";
+  const normalisedPhone = phoneNumber ? phoneNumber.trim().toLowerCase() : "";
+  const deletedDestinations = new Set();
+
+  for (const [key, user] of userStore.entries()) {
+    const matchesUserId = Boolean(userId && user.id === userId);
+    const matchesEmail = Boolean(normalisedEmail && user.email?.trim().toLowerCase() === normalisedEmail);
+    const matchesPhone = Boolean(
+      normalisedPhone && user.phoneNumber?.trim().toLowerCase() === normalisedPhone
+    );
+
+    if (matchesUserId || matchesEmail || matchesPhone) {
+      deletedDestinations.add(user.email?.trim().toLowerCase());
+      deletedDestinations.add(user.phoneNumber?.trim().toLowerCase());
+      userStore.delete(key);
+    }
+  }
+
+  for (const [verificationId, record] of verificationStore.entries()) {
+    const destination = record.destination?.trim().toLowerCase();
+    if (deletedDestinations.has(destination) || destination === normalisedEmail || destination === normalisedPhone) {
+      verificationStore.delete(verificationId);
+    }
+  }
+}
+
 function isTwilioConfigured() {
   return Boolean(TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN && TWILIO_VERIFY_SERVICE_SID);
 }
@@ -331,6 +358,23 @@ app.post("/auth/phone/verify", async (req, res) => {
   const mode = String(req.body?.mode ?? "");
 
   return verifyCode("phone", verificationId, code, mode, res);
+});
+
+app.post("/account/delete", (req, res) => {
+  const userId = String(req.body?.userId ?? "").trim();
+  const email = String(req.body?.email ?? "").trim();
+  const phoneNumber = String(req.body?.phoneNumber ?? "").trim();
+
+  if (!userId && !email && !phoneNumber) {
+    return res.status(400).json({ message: "Account details are required to delete this account." });
+  }
+
+  deleteUserRecords({ userId, email, phoneNumber });
+
+  return res.json({
+    success: true,
+    message: "Account deleted.",
+  });
 });
 
 app.listen(PORT, () => {
